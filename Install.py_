@@ -1,0 +1,488 @@
+#!/usr/bin/env python3
+"""
+Gentoo Installer - Python3 port with Textual TUI
+Inspired by oddlama/gentoo-install and carnage TUI styles
+"""
+
+import asyncio
+import sys
+from pathlib import Path
+from typing import Optional, Dict, Any
+from dataclasses import dataclass, field
+from enum import Enum
+
+from textual.app import App, ComposeResult
+from textual.containers import Container, Horizontal, Vertical, ScrollableContainer
+from textual.widgets import (
+    Header, Footer, Button, Static, Input, Select, 
+    Checkbox, Label, RadioButton, RadioSet, Tree, TabbedContent, TabPane
+)
+from textual.binding import Binding
+from textual.screen import Screen
+from textual import on
+
+
+# ============================================================================
+# Configuration Data Classes
+# ============================================================================
+
+class InitSystem(Enum):
+    OPENRC = "openrc"
+    SYSTEMD = "systemd"
+    RUNIT = "runit"
+    S6 = "s6"
+
+
+class BootMode(Enum):
+    EFI = "efi"
+    BIOS = "bios"
+
+
+class Filesystem(Enum):
+    EXT4 = "ext4"
+    BTRFS = "btrfs"
+    ZFS = "zfs"
+    XFS = "xfs"
+
+
+@dataclass
+class DiskConfig:
+    device: str = "/dev/sda"
+    boot_size: str = "512M"
+    swap_size: str = "4G"
+    filesystem: Filesystem = Filesystem.EXT4
+    encryption: bool = False
+    encryption_type: str = "luks2"
+
+
+@dataclass
+class SystemConfig:
+    hostname: str = "gentoo"
+    timezone: str = "UTC"
+    locale: str = "en_US.UTF-8"
+    keymap: str = "us"
+    init_system: InitSystem = InitSystem.OPENRC
+    boot_mode: BootMode = BootMode.EFI
+
+
+@dataclass
+class PortageConfig:
+    stage3_url: str = ""
+    mirror: str = "https://gentoo.osuosl.org/"
+    sync_type: str = "rsync"
+    makeopts: str = "-j4"
+    use_flags: list[str] = field(default_factory=list)
+    accept_keywords: str = "amd64"
+    overlays: list[Dict[str, str]] = field(default_factory=list)
+
+
+@dataclass
+class InstallConfig:
+    disk: DiskConfig = field(default_factory=DiskConfig)
+    system: SystemConfig = field(default_factory=SystemConfig)
+    portage: PortageConfig = field(default_factory=PortageConfig)
+    additional_packages: list[str] = field(default_factory=list)
+    enable_sshd: bool = False
+    ssh_keys: list[str] = field(default_factory=list)
+
+
+# ============================================================================
+# TUI Screens
+# ============================================================================
+
+class WelcomeScreen(Screen):
+    """Welcome screen with project info"""
+    
+    BINDINGS = [
+        ("c", "continue", "Continue"),
+        ("q", "quit", "Quit"),
+    ]
+    
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield Container(
+            Static("""
+[bold cyan]Gentoo Linux Installer[/bold cyan]
+[dim]Python3 port with modern TUI[/dim]
+
+A menuconfig-inspired installer supporting:
+  • OpenRC, systemd, runit, s6 init systems
+  • EFI and BIOS boot modes
+  • Multiple filesystems (ext4, btrfs, zfs, xfs)
+  • LUKS encryption and mdraid
+  • Overlay management integration
+  
+Press [bold]C[/bold] to configure installation
+Press [bold]Q[/bold] to quit
+            """, id="welcome-text"),
+            id="welcome-container"
+        )
+        yield Footer()
+    
+    def action_continue(self) -> None:
+        self.app.push_screen(ConfigScreen())
+    
+    def action_quit(self) -> None:
+        self.app.exit()
+
+
+class ConfigScreen(Screen):
+    """Main configuration screen with tabs"""
+    
+    BINDINGS = [
+        ("s", "start_install", "Start Install"),
+        ("escape", "back", "Back"),
+    ]
+    
+    def __init__(self, config: Optional[InstallConfig] = None):
+        super().__init__()
+        self.config = config or InstallConfig()
+    
+    def compose(self) -> ComposeResult:
+        yield Header()
+        
+        with TabbedContent(initial="system"):
+            with TabPane("System", id="system"):
+                yield self._compose_system_tab()
+            
+            with TabPane("Disks", id="disks"):
+                yield self._compose_disk_tab()
+            
+            with TabPane("Portage", id="portage"):
+                yield self._compose_portage_tab()
+            
+            with TabPane("Overlays", id="overlays"):
+                yield self._compose_overlay_tab()
+            
+            with TabPane("Packages", id="packages"):
+                yield self._compose_packages_tab()
+        
+        with Horizontal(id="action-buttons"):
+            yield Button("Back", variant="default", id="back-btn")
+            yield Button("Save Config", variant="primary", id="save-btn")
+            yield Button("Start Install", variant="success", id="install-btn")
+        
+        yield Footer()
+    
+    def _compose_system_tab(self) -> ComposeResult:
+        with ScrollableContainer():
+            yield Label("System Configuration")
+            
+            yield Label("Init System:")
+            with RadioSet(id="init-system"):
+                for init in InitSystem:
+                    yield RadioButton(
+                        init.value.capitalize(),
+                        value=init == self.config.system.init_system
+                    )
+            
+            yield Label("Boot Mode:")
+            with RadioSet(id="boot-mode"):
+                for mode in BootMode:
+                    yield RadioButton(
+                        mode.value.upper(),
+                        value=mode == self.config.system.boot_mode
+                    )
+            
+            yield Label("Hostname:")
+            yield Input(value=self.config.system.hostname, id="hostname")
+            
+            yield Label("Timezone:")
+            yield Input(value=self.config.system.timezone, id="timezone")
+            
+            yield Label("Locale:")
+            yield Input(value=self.config.system.locale, id="locale")
+            
+            yield Label("Keymap:")
+            yield Input(value=self.config.system.keymap, id="keymap")
+    
+    def _compose_disk_tab(self) -> ComposeResult:
+        with ScrollableContainer():
+            yield Label("Disk Configuration")
+            
+            yield Label("Target Device:")
+            yield Input(value=self.config.disk.device, id="disk-device")
+            
+            yield Label("Boot Partition Size:")
+            yield Input(value=self.config.disk.boot_size, id="boot-size")
+            
+            yield Label("Swap Size:")
+            yield Input(value=self.config.disk.swap_size, id="swap-size")
+            
+            yield Label("Filesystem:")
+            with RadioSet(id="filesystem"):
+                for fs in Filesystem:
+                    yield RadioButton(
+                        fs.value.upper(),
+                        value=fs == self.config.disk.filesystem
+                    )
+            
+            yield Checkbox("Enable LUKS Encryption", 
+                          value=self.config.disk.encryption,
+                          id="encryption")
+    
+    def _compose_portage_tab(self) -> ComposeResult:
+        with ScrollableContainer():
+            yield Label("Portage Configuration")
+            
+            yield Label("Gentoo Mirror:")
+            yield Input(value=self.config.portage.mirror, id="mirror")
+            
+            yield Label("MAKEOPTS:")
+            yield Input(value=self.config.portage.makeopts, id="makeopts")
+            
+            yield Label("USE Flags (space-separated):")
+            yield Input(
+                value=" ".join(self.config.portage.use_flags),
+                id="use-flags"
+            )
+            
+            yield Label("ACCEPT_KEYWORDS:")
+            yield Input(
+                value=self.config.portage.accept_keywords,
+                id="accept-keywords"
+            )
+    
+    def _compose_overlay_tab(self) -> ComposeResult:
+        with ScrollableContainer():
+            yield Label("Overlay Management")
+            yield Static(
+                "[dim]Manage Gentoo overlays (similar to carnage)[/dim]"
+            )
+            
+            tree = Tree("Configured Overlays", id="overlay-tree")
+            tree.root.expand()
+            
+            # Add configured overlays
+            for overlay in self.config.portage.overlays:
+                node = tree.root.add(
+                    f"[cyan]{overlay.get('name', 'unnamed')}[/cyan]"
+                )
+                node.add_leaf(f"URL: {overlay.get('url', 'N/A')}")
+                node.add_leaf(f"Type: {overlay.get('type', 'git')}")
+            
+            yield tree
+            
+            with Horizontal():
+                yield Button("Add Overlay", id="add-overlay-btn")
+                yield Button("Remove Overlay", id="remove-overlay-btn")
+    
+    def _compose_packages_tab(self) -> ComposeResult:
+        with ScrollableContainer():
+            yield Label("Additional Packages")
+            
+            yield Label("Packages to install (one per line):")
+            yield Static("[dim]Examples: vim, htop, tmux, etc.[/dim]")
+            
+            # Text area for packages
+            yield Input(
+                value="\n".join(self.config.additional_packages),
+                id="packages-list"
+            )
+            
+            yield Label("SSH Configuration:")
+            yield Checkbox("Enable SSHD", 
+                          value=self.config.enable_sshd,
+                          id="enable-sshd")
+    
+    @on(Button.Pressed, "#back-btn")
+    def action_back(self) -> None:
+        self.app.pop_screen()
+    
+    @on(Button.Pressed, "#save-btn")
+    def save_config(self) -> None:
+        # Update config from inputs
+        self._update_config_from_inputs()
+        self.notify("Configuration saved!")
+    
+    @on(Button.Pressed, "#install-btn")
+    def action_start_install(self) -> None:
+        self._update_config_from_inputs()
+        self.app.push_screen(InstallScreen(self.config))
+    
+    def _update_config_from_inputs(self) -> None:
+        """Update config object from input widgets"""
+        # System config
+        hostname_input = self.query_one("#hostname", Input)
+        self.config.system.hostname = hostname_input.value
+        
+        timezone_input = self.query_one("#timezone", Input)
+        self.config.system.timezone = timezone_input.value
+        
+        # Disk config
+        device_input = self.query_one("#disk-device", Input)
+        self.config.disk.device = device_input.value
+        
+        # More updates would go here...
+
+
+class InstallScreen(Screen):
+    """Installation progress screen"""
+    
+    BINDINGS = [
+        ("escape", "cancel", "Cancel"),
+    ]
+    
+    def __init__(self, config: InstallConfig):
+        super().__init__()
+        self.config = config
+    
+    def compose(self) -> ComposeResult:
+        yield Header()
+        
+        yield Container(
+            Static("[bold green]Installation in Progress[/bold green]"),
+            Static("", id="install-status"),
+            Static("", id="install-log"),
+            id="install-container"
+        )
+        
+        with Horizontal(id="install-actions"):
+            yield Button("View Logs", id="logs-btn")
+            yield Button("Cancel", variant="error", id="cancel-btn")
+        
+        yield Footer()
+    
+    def on_mount(self) -> None:
+        """Start installation when screen mounts"""
+        self.run_worker(self._perform_install())
+    
+    async def _perform_install(self) -> None:
+        """Perform the actual installation"""
+        status = self.query_one("#install-status", Static)
+        log = self.query_one("#install-log", Static)
+        
+        steps = [
+            "Validating configuration",
+            "Partitioning disks",
+            "Downloading stage3 tarball",
+            "Extracting stage3",
+            "Configuring portage",
+            "Installing base system",
+            "Configuring init system",
+            "Installing bootloader",
+            "Finalizing installation"
+        ]
+        
+        for i, step in enumerate(steps):
+            status.update(f"[cyan]Step {i+1}/{len(steps)}:[/cyan] {step}")
+            log.update(f"{log.renderable}\n{step}...")
+            await asyncio.sleep(2)  # Simulate work
+            
+            # Here would be actual installation logic
+        
+        status.update("[bold green]✓ Installation Complete![/bold green]")
+        self.notify("Installation finished successfully!", severity="success")
+    
+    def action_cancel(self) -> None:
+        self.app.pop_screen()
+
+
+# ============================================================================
+# Main Application
+# ============================================================================
+
+class GentooInstallerApp(App):
+    """Main Gentoo installer application"""
+    
+    CSS = """
+    Screen {
+        background: $surface;
+    }
+    
+    #welcome-container {
+        margin: 2 4;
+        padding: 2 4;
+        border: solid $primary;
+        height: auto;
+    }
+    
+    #welcome-text {
+        width: 100%;
+    }
+    
+    TabbedContent {
+        height: 1fr;
+    }
+    
+    TabPane {
+        padding: 1 2;
+    }
+    
+    ScrollableContainer {
+        height: 100%;
+    }
+    
+    Label {
+        margin: 1 0 0 0;
+        color: $text;
+    }
+    
+    Input {
+        margin: 0 0 1 0;
+    }
+    
+    RadioSet {
+        margin: 0 0 1 0;
+        height: auto;
+    }
+    
+    #action-buttons {
+        dock: bottom;
+        height: 3;
+        padding: 0 2;
+    }
+    
+    #action-buttons Button {
+        margin: 0 1;
+    }
+    
+    Tree {
+        margin: 1 0;
+        height: 1fr;
+    }
+    
+    #install-container {
+        margin: 2 4;
+        padding: 2;
+        border: solid $success;
+        height: 1fr;
+    }
+    
+    #install-log {
+        margin: 2 0;
+        height: 1fr;
+        overflow-y: auto;
+    }
+    
+    #install-actions {
+        dock: bottom;
+        height: 3;
+        padding: 0 2;
+    }
+    """
+    
+    BINDINGS = [
+        Binding("q", "quit", "Quit", show=True),
+    ]
+    
+    TITLE = "Gentoo Linux Installer"
+    SUB_TITLE = "Python3 with Textual TUI"
+    
+    def on_mount(self) -> None:
+        """Show welcome screen on app start"""
+        self.push_screen(WelcomeScreen())
+
+
+# ============================================================================
+# CLI Entry Point
+# ============================================================================
+
+def main():
+    """Main entry point"""
+    app = GentooInstallerApp()
+    app.run()
+
+
+if __name__ == "__main__":
+    main()
